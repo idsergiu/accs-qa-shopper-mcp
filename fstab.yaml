@@ -1,0 +1,7 @@
+mountpoints:
+  /:
+    url: https://content.da.live/idsergiu/accs-qa-shopper-mcp/
+    type: markup
+
+folders:
+  /products/: /products/default

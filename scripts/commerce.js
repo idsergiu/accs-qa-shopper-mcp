@@ -9,10 +9,22 @@ import {
 import { events } from '@dropins/tools/event-bus.js';
 import { FetchGraphQL } from '@dropins/tools/fetch-graphql.js';
 import {
+  buildBlock,
   getMetadata,
   readBlockConfig,
 } from './aem.js';
 import initializeDropins from './initializers/index.js';
+
+let consentGranted = false;
+
+/** Returns the latest upstream consent notification for this document. */
+export function isConsentGranted() {
+  return consentGranted;
+}
+
+window.addEventListener('consent.update', ({ detail }) => {
+  consentGranted = detail?.consented === true;
+});
 
 /**
  * Sanitizes the given string by:
@@ -49,16 +61,8 @@ export const CS_FETCH_GRAPHQL = new FetchGraphQL();
  */
 
 // Environment checks
-export const IS_UE = window.location.hostname.includes('ue.da.live');
 export const IS_DA = new URL(window.location.href).searchParams.has('dapreview');
-
-/**
- * Product template paths - pages that are templates and should use
- * default/fake SKUs. Should be relative to root path, ie "/" , "/fr/" , etc.
- */
-export const PRODUCT_TEMPLATE_PATHS = [
-  'products/default',
-];
+export const IS_EW = new URL(window.location.href).searchParams.get('quick-edit') === 'on';
 
 // PATHS
 export const SUPPORT_PATH = '/support';
@@ -80,6 +84,7 @@ export const CUSTOMER_ORDERS_PATH = `${CUSTOMER_PATH}/orders`;
 export const CUSTOMER_RETURNS_PATH = `${CUSTOMER_PATH}/returns`;
 export const CUSTOMER_ADDRESS_PATH = `${CUSTOMER_PATH}/address`;
 export const CUSTOMER_LOGIN_PATH = `${CUSTOMER_PATH}/login`;
+export const CUSTOMER_CREATE_PATH = `${CUSTOMER_PATH}/create`;
 export const CUSTOMER_ACCOUNT_PATH = `${CUSTOMER_PATH}/account`;
 export const CUSTOMER_FORGOTPASSWORD_PATH = `${CUSTOMER_PATH}/forgotpassword`;
 export const SALES_ORDER_VIEW_PATH = '/sales/order/view/';
@@ -107,6 +112,8 @@ export const authPrivacyPolicyConsentSlot = {
     link.href = PRIVACY_POLICY_PATH;
     link.target = '_blank';
     link.textContent = 'Privacy Policy';
+    link.style.textDecoration = 'underline';
+    link.style.textUnderlineOffset = '6px';
 
     wrapper.append(
       'By creating an account, you acknowledge that you have read and agree to our ',
@@ -313,7 +320,6 @@ export async function loadCommerceLazy() {
   // Initialize Adobe Client Data Layer
   await import('./acdl/adobe-client-data-layer.min.js');
 
-  // Track history
   trackHistory();
 }
 
@@ -639,30 +645,37 @@ function getSkuFromUrl() {
 function getDefaultSkuFromBlock() {
   const productDetailsBlock = document.querySelector('.product-details.block');
   if (!productDetailsBlock) {
-    console.warn('No product-details block found');
     return null;
   }
 
   const config = readBlockConfig(productDetailsBlock);
-  if (!config.defaultsku) {
-    console.warn('No defaultSku found in product-details block');
-    return null;
-  }
-  return config.defaultsku;
+  return config.defaultsku || null;
 }
 
 /**
- * Checks if the current page is a product template page.
- * @returns {boolean} True if the current page matches a product template path
+ * Renders promotion/discount rule labels for a cart item, keeping them in sync
+ * as the item's data changes. Used by the cart, mini-cart, and checkout
+ * order-summary line items, which all share the same dropin cart-item context.
+ * @param {Object} ctx - The dropin cart-item Footer slot context
+ * @returns {HTMLElement} The promotions wrapper element
  */
-export function isProductTemplate() {
-  const root = getRootPath();
-  const { pathname } = window.location;
+export function renderCartItemPromotions(ctx) {
+  const promotionsWrapper = document.createElement('div');
+  promotionsWrapper.className = 'cart-item-promotions';
 
-  return PRODUCT_TEMPLATE_PATHS.some((templatePath) => {
-    const fullPath = root ? `${root}${templatePath}` : templatePath;
-    return pathname === fullPath || pathname === fullPath.replace(/\/$/, '');
+  ctx.onChange((next) => {
+    promotionsWrapper.innerHTML = '';
+    next.item?.discount?.label?.forEach((label) => {
+      const promoDiv = document.createElement('div');
+      promoDiv.className = 'cart-item-promotion-label';
+      promoDiv.textContent = label;
+      promotionsWrapper.appendChild(promoDiv);
+    });
   });
+
+  ctx.appendChild(promotionsWrapper);
+
+  return promotionsWrapper;
 }
 
 export function getProductLink(urlKey, sku) {
@@ -678,14 +691,14 @@ export function getProductLink(urlKey, sku) {
 }
 
 /**
- * Gets the product SKU from metadata or URL fallback.
- * @returns {string|null} The SKU from metadata or URL, or null if not found
+ * Gets the current page's product sku, preferring the default SKU from the
+ * product-details block in authoring environments.
+ * @returns {string|null} The SKU from metadata, url, or block config
  */
 export function getProductSku() {
-  if (isProductTemplate() && (IS_UE || IS_DA)) {
-    return getDefaultSkuFromBlock();
+  if (IS_DA || IS_EW) {
+    return getMetadata('sku') || getDefaultSkuFromBlock();
   }
-
   return getMetadata('sku') || getSkuFromUrl();
 }
 
@@ -698,38 +711,70 @@ export function getOptionsUIDsFromUrl() {
 }
 
 /**
+ * Determines the store identifier for tracking history based on configuration headers.
+ * @returns {string|undefined} Store identifier based on header values or undefined.
+ */
+export function getStoreIdentifier() {
+  const headers = getHeaders('cs');
+  const saasStoreIdentifier = 'magento-store-view-code';
+  const acoStoreIdentifier = 'ac-view-id';
+  const storeIdentifierKey = Object.keys(headers).find(
+    (key) => [saasStoreIdentifier, acoStoreIdentifier].includes(key.toLowerCase()),
+  );
+  const storeIdentifier = storeIdentifierKey ? headers[storeIdentifierKey] : undefined;
+  if (!storeIdentifier) {
+    console.warn('No store view code found in config headers for tracking history');
+    return undefined;
+  }
+  return storeIdentifier;
+}
+
+/**
  * Tracks user browsing and purchase history for recommendations.
  * Stores product view history and purchase history in localStorage.
  */
+let historyTrackingInitialized = false;
+
 function trackHistory() {
-  if (!getConsent('commerce-recommendations')) {
+  if (historyTrackingInitialized) {
     return;
   }
-  // Store product view history in session storage
-  const storeViewCode = getConfigValue('headers.cs.Magento-Store-View-Code');
-  window.adobeDataLayer.push((dl) => {
-    dl.addEventListener('adobeDataLayer:change', (event) => {
-      if (!event.productContext || !event.productContext.sku) {
-        return;
-      }
-      const key = `${storeViewCode}:productViewHistory`;
-      let viewHistory = JSON.parse(window.localStorage.getItem(key) || '[]');
-      viewHistory = viewHistory.filter((item) => item.sku !== event.productContext.sku);
-      viewHistory.push({ date: new Date().toISOString(), sku: event.productContext.sku });
-      window.localStorage.setItem(key, JSON.stringify(viewHistory.slice(-20)));
-    }, { path: 'productContext' });
-    dl.addEventListener('place-order', () => {
-      const shoppingCartContext = dl.getState('shoppingCartContext');
-      if (!shoppingCartContext) {
-        return;
-      }
-      const key = `${storeViewCode}:purchaseHistory`;
-      const purchasedProducts = shoppingCartContext.items.map((item) => item.product.sku);
-      const purchaseHistory = JSON.parse(window.localStorage.getItem(key) || '[]');
-      purchaseHistory.push({ date: new Date().toISOString(), items: purchasedProducts });
-      window.localStorage.setItem(key, JSON.stringify(purchaseHistory.slice(-5)));
+  const storeIdentifier = getStoreIdentifier();
+  if (storeIdentifier) {
+    historyTrackingInitialized = true;
+    window.adobeDataLayer.push((dl) => {
+      const recordProductView = (event) => {
+        // Speculation Rules prerendering pushes productContext once immediately and
+        // again on activation. Ignore the prerender-only push so hovering a link
+        // doesn't record a view that never actually happened.
+        if (document.prerendering || !event.productContext || !event.productContext.sku) {
+          return;
+        }
+        const key = `${storeIdentifier}:productViewHistory`;
+        let viewHistory = JSON.parse(window.localStorage.getItem(key) || '[]');
+        viewHistory = viewHistory.filter((item) => item.sku !== event.productContext.sku);
+        viewHistory.push({ date: new Date().toISOString(), sku: event.productContext.sku });
+        window.localStorage.setItem(key, JSON.stringify(viewHistory.slice(-20)));
+      };
+      dl.addEventListener('adobeDataLayer:change', recordProductView, {
+        path: 'productContext',
+      });
+      dl.addEventListener('place-order', () => {
+        if (document.prerendering) {
+          return;
+        }
+        const shoppingCartContext = dl.getState('shoppingCartContext');
+        if (!shoppingCartContext) {
+          return;
+        }
+        const key = `${storeIdentifier}:purchaseHistory`;
+        const purchasedProducts = shoppingCartContext.items.map((item) => item.product.sku);
+        const purchaseHistory = JSON.parse(window.localStorage.getItem(key) || '[]');
+        purchaseHistory.push({ date: new Date().toISOString(), items: purchasedProducts });
+        window.localStorage.setItem(key, JSON.stringify(purchaseHistory.slice(-20)));
+      });
     });
-  });
+  }
 }
 
 /**
@@ -805,16 +850,6 @@ export function checkIsAuthenticated() {
 }
 
 /**
- * Check if consent was given for a specific topic.
- * @param {*} topic Topic identifier
- * @returns {boolean} True if consent was given
- */
-export function getConsent(_topic) {
-  console.warn('getConsent not implemented');
-  return true;
-}
-
-/**
  * Automatically links modal functionality to elements
  * @param {Element} element - The element to attach modal functionality to
  */
@@ -860,4 +895,20 @@ export function decorateSections(main) {
     section.dataset.sectionStatus = 'initialized';
     section.style.display = 'none';
   });
+}
+
+/**
+ * Injects a product-details block into the first child of main.
+ * @param {Element} main The main element
+ */
+export function buildPDPBlock(main) {
+  const block = buildBlock('product-details', { elems: [] });
+  const targetSection = main.querySelector(':scope > div:first-child');
+  if (targetSection) {
+    targetSection.prepend(block);
+  } else {
+    const section = document.createElement('div');
+    section.append(block);
+    main.prepend(section);
+  }
 }

@@ -41,6 +41,7 @@ import { render as CartProvider } from '@dropins/storefront-cart/render.js';
 // Payment Services Dropin
 import { PaymentMethodCode } from '@dropins/storefront-payment-services/api.js';
 import CreditCard from '@dropins/storefront-payment-services/containers/CreditCard.js';
+import VaultedCreditCard from '@dropins/storefront-payment-services/containers/VaultedCreditCard.js';
 import { render as PaymentServices } from '@dropins/storefront-payment-services/render.js';
 
 // Tools
@@ -67,6 +68,7 @@ import {
   authPrivacyPolicyConsentSlot,
   fetchPlaceholders,
   rootLink,
+  renderCartItemPromotions,
 } from '../../scripts/commerce.js';
 
 // Constants
@@ -323,6 +325,25 @@ export const renderBillToShippingAddress = async (container) => renderContainer(
 );
 
 /**
+ * Resyncs the cart's billing address to what checkout currently shows. Needed when
+ * switching from a saved card back to a new payment method, since the saved card can
+ * overwrite the cart's billing address server-side while it is selected.
+ * @param {boolean} isBillToShipping - Whether the "bill to shipping" checkbox is checked
+ * @returns {void}
+ */
+export const resyncBillingAddress = (isBillToShipping) => {
+  if (isBillToShipping) {
+    checkoutApi.setBillingAddress({ sameAsShipping: true });
+    return;
+  }
+
+  const billingFormValues = events.lastPayload('checkout/addresses/billing');
+  if (billingFormValues) {
+    setAddressOnCart({ type: 'billing' })(billingFormValues);
+  }
+};
+
+/**
  * Renders available shipping methods with selection interface
  * @param {HTMLElement} container - DOM element to render shipping methods in
  * @returns {Promise<Object>} - The rendered shipping methods component
@@ -335,10 +356,9 @@ export const renderShippingMethods = async (container) => renderContainer(
 /**
  * Renders payment methods with credit card integration - original regular checkout functionality
  * @param {HTMLElement} container - DOM element to render payment methods in
- * @param {Object} creditCardFormRef - React-style ref for credit card form
  * @returns {Promise<Object>} - The rendered payment methods component
  */
-export const renderPaymentMethods = async (container, creditCardFormRef) => renderContainer(
+export const renderPaymentMethods = async (container) => renderContainer(
   CONTAINERS.PAYMENT_METHODS,
   async () => CheckoutProvider.render(PaymentMethods, {
     slots: {
@@ -347,10 +367,7 @@ export const renderPaymentMethods = async (container, creditCardFormRef) => rend
           render: (ctx) => {
             const $creditCard = document.createElement('div');
 
-            PaymentServices.render(CreditCard, {
-              getCartId: () => ctx.cartId,
-              creditCardFormRef,
-            })($creditCard);
+            PaymentServices.render(CreditCard)($creditCard);
 
             ctx.replaceHTML($creditCard);
           },
@@ -372,6 +389,20 @@ export const renderPaymentMethods = async (container, creditCardFormRef) => rend
         },
         [PaymentMethodCode.FASTLANE]: {
           enabled: false,
+        },
+      },
+      StoredMethods: {
+        [PaymentMethodCode.VAULT]: {
+          tokenCode: PaymentMethodCode.CREDIT_CARD,
+          render: (ctx) => {
+            const $vaultedCard = document.createElement('div');
+
+            PaymentServices.render(VaultedCreditCard, {
+              tokenDetails: ctx.details,
+            })($vaultedCard);
+
+            ctx.replaceHTML($vaultedCard);
+          },
         },
       },
     },
@@ -508,6 +539,7 @@ export const renderCartSummaryList = async (container) => renderContainer(
           editCartLink.href = rootLink('/cart');
           editCartLink.rel = 'noreferrer';
           editCartLink.innerText = placeholders?.Checkout?.Summary?.Edit;
+          editCartLink.setAttribute('aria-label', `${placeholders?.Checkout?.Summary?.Edit} cart`);
 
           cartSummaryListHeading.appendChild(cartSummaryListHeadingText);
           cartSummaryListHeading.appendChild(editCartLink);
@@ -532,7 +564,12 @@ export const renderCartSummaryList = async (container) => renderContainer(
             },
           });
         },
-        Footer: renderCartGiftOptions,
+        Footer: (ctx) => {
+          // Promotion / discount rule labels
+          renderCartItemPromotions(ctx);
+          // Gift Options
+          renderCartGiftOptions(ctx);
+        },
       },
     })(container);
   },

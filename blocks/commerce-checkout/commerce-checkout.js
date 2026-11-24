@@ -17,11 +17,10 @@ import {
 } from '@dropins/storefront-checkout/lib/utils.js';
 
 // Payment Services Dropin
-import { PaymentMethodCode } from '@dropins/storefront-payment-services/api.js';
+import * as paymentsApi from '@dropins/storefront-payment-services/api.js';
 
 // Block Utilities
 import {
-  buildOrderDetailsUrl,
   displayOverlaySpinner,
   removeOverlaySpinner,
 } from './utils.js';
@@ -52,6 +51,7 @@ import {
   renderShippingAddressFormSkeleton,
   renderShippingMethods,
   renderTermsAndConditions,
+  resyncBillingAddress,
 } from './containers.js';
 
 // Constants
@@ -73,8 +73,12 @@ import '../../scripts/initializers/checkout.js';
 import '../../scripts/initializers/order.js';
 import '../../scripts/initializers/payment-services.js';
 
-// Checkout success block import and CSS preload
-import { renderCheckoutSuccess, preloadCheckoutSuccess } from '../commerce-checkout-success/commerce-checkout-success.js';
+// Checkout success page
+import {
+  buildOrderDetailsUrl,
+  renderCheckoutSuccess,
+  preloadCheckoutSuccess,
+} from '../commerce-checkout-success/commerce-checkout-success.js';
 
 preloadCheckoutSuccess();
 
@@ -101,7 +105,6 @@ export default async function decorate(block) {
 
   const shippingFormRef = { current: null };
   const billingFormRef = { current: null };
-  const creditCardFormRef = { current: null };
   const loaderRef = { current: null };
 
   events.on('order/placed', () => {
@@ -118,6 +121,7 @@ export default async function decorate(block) {
   // Get all checkout elements using centralized selectors
   const $content = getElement(selectors.checkout.content);
   const $loader = getElement(selectors.checkout.loader);
+  const $loaderStatus = getElement(selectors.checkout.loaderStatus);
   const $mergedCartBanner = getElement(selectors.checkout.mergedCartBanner);
   const $heading = getElement(selectors.checkout.heading);
   const $serverError = getElement(selectors.checkout.serverError);
@@ -144,29 +148,43 @@ export default async function decorate(block) {
     { name: TERMS_AND_CONDITIONS_FORM_NAME },
   ]);
 
-  const handlePlaceOrder = async ({ cartId, code }) => {
-    await displayOverlaySpinner(loaderRef, $loader);
+  const trySubmitPaymentServicesCreditCard = async () => {
     try {
-      // Payment Services credit card
-      if (code === PaymentMethodCode.CREDIT_CARD) {
-        if (!creditCardFormRef.current) {
+      await paymentsApi.submitCreditCard();
+      return true;
+    } catch (error) {
+      switch (error.code) {
+        case 'payment-services/credit-card-form-not-rendered':
           console.error('Credit card form not rendered.');
-          return;
-        }
-        if (!creditCardFormRef.current.validate()) {
+          return false;
+        case 'payment-services/credit-card-form-invalid':
           // Credit card form invalid; abort order placement
+          return false;
+        default:
+          throw error;
+      }
+    }
+  };
+
+  const handlePlaceOrder = async ({ cartId, code }) => {
+    await displayOverlaySpinner(loaderRef, $loader, $loaderStatus);
+    try {
+      // Payment Services credit card or saved (vaulted) card
+      if (
+        code === paymentsApi.PaymentMethodCode.CREDIT_CARD
+        || code === paymentsApi.PaymentMethodCode.VAULT
+      ) {
+        const success = await trySubmitPaymentServicesCreditCard();
+        if (!success) {
           return;
         }
-        // Submit Payment Services credit card form
-        await creditCardFormRef.current.submit();
       }
-      // Place order
       await orderApi.placeOrder(cartId);
     } catch (error) {
       console.error(error);
       throw error;
     } finally {
-      removeOverlaySpinner(loaderRef, $loader);
+      removeOverlaySpinner(loaderRef, $loader, $loaderStatus);
     }
   };
 
@@ -206,7 +224,7 @@ export default async function decorate(block) {
 
     renderShippingMethods($delivery),
 
-    renderPaymentMethods($paymentMethods, creditCardFormRef),
+    renderPaymentMethods($paymentMethods),
 
     renderBillingAddressFormSkeleton($billingForm),
 
@@ -223,7 +241,7 @@ export default async function decorate(block) {
     await initReCaptcha(0);
     if (data.isGuest) await displayGuestAddressForms(data);
     else {
-      removeOverlaySpinner(loaderRef, $loader);
+      removeOverlaySpinner(loaderRef, $loader, $loaderStatus);
       await displayCustomerAddressForms(data);
     }
   }
@@ -296,9 +314,21 @@ export default async function decorate(block) {
     window.location.reload();
   }
 
+  let wasStoredPaymentMethodSelected = false;
+
   function handleCheckoutValues(payload) {
-    const { isBillToShipping } = payload;
-    $billingForm.style.display = isBillToShipping ? 'none' : 'block';
+    const { isBillToShipping, selectedPaymentMethod } = payload;
+    const isStoredPaymentMethodSelected = !!selectedPaymentMethod?.additionalData?.publicHash;
+
+    $billToShipping.style.display = isStoredPaymentMethodSelected ? 'none' : 'block';
+    $billingForm.style.display = (isBillToShipping || isStoredPaymentMethodSelected) ? 'none' : 'block';
+    $paymentMethods.classList.toggle('checkout__payment-methods--stored-selected', isStoredPaymentMethodSelected);
+
+    if (wasStoredPaymentMethodSelected && !isStoredPaymentMethodSelected) {
+      resyncBillingAddress(isBillToShipping);
+    }
+
+    wasStoredPaymentMethodSelected = isStoredPaymentMethodSelected;
   }
 
   async function handleOrderPlaced(orderData) {
